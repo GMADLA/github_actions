@@ -1,0 +1,490 @@
+name: test
+on:
+  repository_dispatch:
+    types: [test-command]
+
+defaults:
+  run:
+    # We need -e -o pipefail for consistency with GitHub Actions's default behavior
+    shell: bash -e -o pipefail {0}
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    outputs:
+      ack-reaction: ${{ steps.parse.outputs.reaction }}
+      run-ping: ${{ steps.parse.outputs.ping }}
+      run-bats: ${{ steps.parse.outputs.bats }}
+      run-readme: ${{ steps.parse.outputs.readme }}
+      run-terratest: ${{ steps.parse.outputs.terratest }}
+    steps:
+    - name: Parse Args
+      id: parse
+      env:
+        DEBUG: ${{ toJSON(github.event.client_payload.slash_command) }}
+        ARGS_V1: ${{ github.event.client_payload.slash_command.arg1 }}
+        ARGS_V2: ${{ github.event.client_payload.slash_command.args.unnamed.all }}
+      shell: bash
+      run: |
+        REACTION="-1"
+        ARGS="${ARGS_V1}${ARGS_V2}"
+        printf "Args are %s\n" "$ARGS"
+        printf "\n\nslash_command is %s\n\n" "$DEBUG"
+        # ack is not a command. We send ack if this was launched from a comment.
+        COMMANDS=(PING BATS README TERRATEST)
+        if printf "%s" "${ARGS^^}" | grep -qE '\bALL\b'; then
+          REACTION="+1"
+          # "all" explicitly does not include "ping"
+          for cmd in "${COMMANDS[@]}"; do
+            [[ $cmd == "PING" ]] && ! { printf "%s" "${ARGS^^}" | grep -qE '\bPING\b'; } && continue
+            printf -v "$cmd" "true"
+          done
+        else
+          for cmd in "${COMMANDS[@]}"; do
+            if printf "%s" "${ARGS^^}" | grep -qE "\b${cmd}\b"; then
+              REACTION="+1"
+              printf -v "$cmd" "true"
+            fi
+          done
+        fi
+        for out in REACTION "${COMMANDS[@]}"; do
+          printf "::set-output name=%s::%s\n" "${out,,}" "${!out:-false}"
+          printf "%s=%s\n" "${out,,}" "${!out:-false}"
+        done
+  ack:
+    runs-on: ubuntu-latest
+    needs: parse
+    if: github.event.client_payload.github.payload.comment.id != ''
+    steps:
+      - name: "Add reaction 👍👎️"
+        uses: GMADLA/github_actions/github/create-or-update-comment@0.28.0
+        with:
+          repository: ${{ github.event.client_payload.github.payload.repository.full_name }}
+          comment-id: ${{ github.event.client_payload.github.payload.comment.id }}
+          token: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+          reactions: ${{ needs.parse.outputs.ack-reaction }}
+
+  ping:
+    runs-on: ubuntu-latest
+    needs: parse
+    if: needs.parse.outputs.run-ping == 'true'
+    steps:
+    # Update GitHub status for dispatch events
+    - name: "Update GitHub Status for this ref"
+      #if: ${{ github.event_name == 'repository_dispatch' }}
+      uses: 'docker://cloudposse/github-status-updater'
+      with:
+        # We need to use args because GitHub actions overwrites many `GITHUB_*` environment variables
+        args: "-action update_state -ref ${{ github.event.client_payload.pull_request.head.sha }} -repo ${{ github.event.client_payload.github.payload.repository.name }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        GITHUB_STATE: success
+        GITHUB_CONTEXT: 'test/ping'
+        GITHUB_DESCRIPTION: "pong"
+        GITHUB_TARGET_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        GITHUB_OWNER: ${{ github.event.client_payload.github.payload.repository.owner.login }}
+
+  readme:
+    runs-on: ubuntu-latest
+    needs: parse
+    if: needs.parse.outputs.run-readme == 'true'
+    container: cloudposse/test-harness:latest
+    env:
+      MAKE_INCLUDES: Makefile
+    steps:
+    # Update GitHub status for dispatch events
+    - name: "Update GitHub Status for pending"
+      uses: docker://cloudposse/github-status-updater
+      with:
+        args: "-action update_state -ref ${{ github.event.client_payload.pull_request.head.sha }} -repo ${{ github.event.client_payload.github.payload.repository.name }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        GITHUB_STATE: pending
+        GITHUB_CONTEXT: "test/readme"
+        GITHUB_DESCRIPTION: "tests started by @${{ github.event.client_payload.github.actor }}"
+        GITHUB_TARGET_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        GITHUB_REF: ${{ github.event.client_payload.pull_request.head.ref }}
+        GITHUB_OWNER: ${{ github.event.client_payload.github.payload.repository.owner.login }}
+
+
+    # Checkout the code from GitHub Pull Request
+    - name: "Checkout code for ChatOps"
+      uses: actions/checkout@v2
+      with:
+        token: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        repository: ${{ github.event.client_payload.pull_request.head.repo.full_name }}
+        ref: ${{ github.event.client_payload.pull_request.head.ref }}
+
+    # Initialize the build-harness with make target helpers
+    - name: "Initialize build-harness"
+      env:
+        BUILD_HARNESS_BRANCH: master
+      run: make init
+
+    # Run the bats tests from the test-harness against the module
+    - name: "Test that README.md was generated from README.yaml"
+      run: make readme/lint
+
+    # Update GitHub status for dispatch events
+    - name: "Update GitHub Status for failure"
+      if: ${{ failure() }}
+      uses: docker://cloudposse/github-status-updater
+      with:
+        args: "-action update_state -ref ${{ github.event.client_payload.pull_request.head.sha }} -repo ${{ github.event.client_payload.github.payload.repository.name }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        GITHUB_STATE: failure
+        GITHUB_CONTEXT: "test/readme"
+        GITHUB_DESCRIPTION: "tests failed"
+        GITHUB_TARGET_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        GITHUB_REF: ${{ github.event.client_payload.pull_request.head.ref }}
+        GITHUB_OWNER: ${{ github.event.client_payload.github.payload.repository.owner.login }}
+
+    # Update GitHub status for dispatch events
+    - name: "Update GitHub Status for success"
+      uses: docker://cloudposse/github-status-updater
+      with:
+        args: "-action update_state -ref ${{ github.event.client_payload.pull_request.head.sha }} -repo ${{ github.event.client_payload.github.payload.repository.name }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        GITHUB_STATE: success
+        GITHUB_CONTEXT: "test/readme"
+        GITHUB_DESCRIPTION: "tests passed"
+        GITHUB_TARGET_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        GITHUB_REF: ${{ github.event.client_payload.pull_request.head.ref }}
+        GITHUB_OWNER: ${{ github.event.client_payload.github.payload.repository.owner.login }}
+
+    # Update GitHub status for dispatch events
+    - name: "Update GitHub Status for cancelled"
+      if: ${{ cancelled() }}
+      uses: docker://cloudposse/github-status-updater
+      with:
+        args: "-action update_state -ref ${{ github.event.client_payload.pull_request.head.sha }} -repo ${{ github.event.client_payload.github.payload.repository.name }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        GITHUB_STATE: error
+        GITHUB_CONTEXT: "test/readme"
+        GITHUB_DESCRIPTION: "tests cancelled"
+        GITHUB_TARGET_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        GITHUB_REF: ${{ github.event.client_payload.pull_request.head.ref }}
+        GITHUB_OWNER: ${{ github.event.client_payload.github.payload.repository.owner.login }}
+
+  bats:
+    runs-on: ubuntu-latest
+    needs: parse
+    if: needs.parse.outputs.run-bats == 'true'
+    container: cloudposse/test-harness:latest
+    env:
+      MAKE_INCLUDES: Makefile
+      TF_PLUGIN_CACHE_DIR: /tmp
+    steps:
+    # Update GitHub status for dispatch events
+    - name: "Update GitHub Status for pending"
+      uses: docker://cloudposse/github-status-updater
+      with:
+        args: "-action update_state -ref ${{ github.event.client_payload.pull_request.head.sha }} -repo ${{ github.event.client_payload.github.payload.repository.name }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        GITHUB_STATE: pending
+        GITHUB_CONTEXT: "test/bats"
+        GITHUB_DESCRIPTION: "tests started by @${{ github.event.client_payload.github.actor }}"
+        GITHUB_TARGET_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        GITHUB_REF: ${{ github.event.client_payload.pull_request.head.ref }}
+        GITHUB_OWNER: ${{ github.event.client_payload.github.payload.repository.owner.login }}
+
+    # Checkout the code from GitHub Pull Request
+    - name: "Checkout code for ChatOps"
+      uses: actions/checkout@v2
+      with:
+        token: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        repository: ${{ github.event.client_payload.pull_request.head.repo.full_name }}
+        ref: ${{ github.event.client_payload.pull_request.head.ref }}
+
+    # Determine requied version of terraform based on the target branch of the pull request. Then update the PATH to use it.
+    - name: "Determine required terraform version"
+      shell: bash -x -e -o pipefail {0}
+      run: |
+        # Some legacy support is on 0.11 branches and we determine the Terraform version based on the target branch name
+        VERSION=$(cut -d/ -f1 <<<${BASE_REF})
+        if [[ ${VERSION} != '0.11' ]]; then
+          TF012=0.12.31
+          TF013=$(terraform-0.13 version --json | jq -r .terraform_version)
+          TF014=$(terraform-0.14 version --json | jq -r .terraform_version)
+          TF015=$(terraform-0.15 version --json | jq -r .terraform_version)
+          TF1=$(terraform-1 version --json | jq -r .terraform_version)
+          # vert exits non-zero if any of the versions are not acceptable, so `|| [[ -n "$VERSION" ]]` for a real error check
+          FULL_VERSION=$(vert -s "$(terraform-config-inspect --json . | jq -r '.required_core[]')" "$TF012" "$TF013" "$TF014" "$TF015" "$TF1" | head -1) || [[ -n "$VERSION" ]]
+          VERSION=${FULL_VERSION:0:4}
+          echo Full version to use is ${FULL_VERSION}, setting VERSION to ${VERSION}
+        fi
+        # Match lables like `terraform/0.12` or nothing (to prevent non-zero exit code)
+        # Use [0-9] because \d is not standard part of egrep
+        OVERRIDE_VERSION=$(grep -Eo '(terraform/[0-9]+\.[x0-9]+|)' <<<${LABELS} | cut -d/ -f2)
+        if [ -n "${OVERRIDE_VERSION}" ]; then
+          VERSION=${OVERRIDE_VERSION}
+          echo "Terraform ${VERSION} is required based on labels..."
+        else
+          echo "Terraform ${VERSION} is required for ${BASE_REF}..."
+        fi
+
+        [[ $VERSION =~ ^1\. ]] && VERSION=1
+
+        PATH_TO_TERRAFORM="/usr/local/terraform/${VERSION}/bin"
+        if [ -x "${PATH_TO_TERRAFORM}/terraform" ]; then
+          echo "${PATH_TO_TERRAFORM}" >> "$GITHUB_PATH"
+        else
+          echo "Unable to locate executable for terraform ${VERSION}" >&2
+          exit 1
+        fi
+
+      env:
+        # Pull request target branch
+        BASE_REF: ${{ github.event.client_payload.pull_request.base.ref }}
+        LABELS: ${{ join(github.event.client_payload.pull_request.labels.*.name, '\n') }}
+
+    # Initialize the test-harness which has a library of bats tests
+    - name: "Initialize test-harness"
+      env:
+        TEST_HARNESS_BRANCH: master
+      run: make -C test/ clean init
+
+    # Run the bats tests from the test-harness against the module
+    - name: "Test module with bats"
+      run: make -C test/ module
+
+    # Run the bats tests from the test-harness against the example
+    - name: "Test `examples/complete` with bats"
+      run: make -C test/ examples/complete
+
+    # Update GitHub status for dispatch events
+    - name: "Update GitHub Status for failure"
+      if: ${{ failure() }}
+      uses: docker://cloudposse/github-status-updater
+      with:
+        args: "-action update_state -ref ${{ github.event.client_payload.pull_request.head.sha }} -repo ${{ github.event.client_payload.github.payload.repository.name }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        GITHUB_STATE: failure
+        GITHUB_CONTEXT: "test/bats"
+        GITHUB_DESCRIPTION: "tests failed"
+        GITHUB_TARGET_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        GITHUB_REF: ${{ github.event.client_payload.pull_request.head.ref }}
+        GITHUB_OWNER: ${{ github.event.client_payload.github.payload.repository.owner.login }}
+
+    # Update GitHub status for dispatch events
+    - name: "Update GitHub Status for success"
+      uses: docker://cloudposse/github-status-updater
+      with:
+        args: "-action update_state -ref ${{ github.event.client_payload.pull_request.head.sha }} -repo ${{ github.event.client_payload.github.payload.repository.name }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        GITHUB_STATE: success
+        GITHUB_CONTEXT: "test/bats"
+        GITHUB_DESCRIPTION: "tests passed"
+        GITHUB_TARGET_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        GITHUB_REF: ${{ github.event.client_payload.pull_request.head.ref }}
+        GITHUB_OWNER: ${{ github.event.client_payload.github.payload.repository.owner.login }}
+
+    # Update GitHub status for dispatch events
+    - name: "Update GitHub Status for cancelled"
+      if: ${{ cancelled() }}
+      uses: docker://cloudposse/github-status-updater
+      with:
+        args: "-action update_state -ref ${{ github.event.client_payload.pull_request.head.sha }} -repo ${{ github.event.client_payload.github.payload.repository.name }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        GITHUB_STATE: error
+        GITHUB_CONTEXT: "test/bats"
+        GITHUB_DESCRIPTION: "tests cancelled"
+        GITHUB_TARGET_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        GITHUB_REF: ${{ github.event.client_payload.pull_request.head.ref }}
+        GITHUB_OWNER: ${{ github.event.client_payload.github.payload.repository.owner.login }}
+
+  terratest:
+    runs-on: ubuntu-latest
+    needs: parse
+    if: needs.parse.outputs.run-terratest == 'true'
+    container: cloudposse/test-harness:latest
+    env:
+      MAKE_INCLUDES: Makefile
+    steps:
+    # Update GitHub status for dispatch events
+    - name: "Update GitHub Status for pending"
+      uses: docker://cloudposse/github-status-updater
+      with:
+        args: "-action update_state -ref ${{ github.event.client_payload.pull_request.head.sha }} -repo ${{ github.event.client_payload.github.payload.repository.name }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        GITHUB_STATE: pending
+        GITHUB_CONTEXT: "test/terratest"
+        GITHUB_DESCRIPTION: "tests started by @${{ github.event.client_payload.github.actor }}"
+        GITHUB_TARGET_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        GITHUB_REF: ${{ github.event.client_payload.pull_request.head.ref }}
+        GITHUB_OWNER: ${{ github.event.client_payload.github.payload.repository.owner.login }}
+
+    # Checkout the code from GitHub Pull Request
+    - name: "Checkout code for ChatOps"
+      uses: actions/checkout@v2
+      with:
+        token: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        repository: ${{ github.event.client_payload.pull_request.head.repo.full_name }}
+        ref: ${{ github.event.client_payload.pull_request.head.ref }}
+
+    # Determine requied version of terraform based on the target branch of the pull request. Then update the PATH to use it.
+    - name: "Determine required terraform version"
+      shell: bash -x -e -o pipefail {0}
+      run: |
+        # Some legacy support is on 0.11 branches and we determine the Terraform version based on the target branch name
+        VERSION=$(cut -d/ -f1 <<<${BASE_REF})
+        if [[ ${VERSION} != '0.11' ]]; then
+          TF012=0.12.31
+          TF013=$(terraform-0.13 version --json | jq -r .terraform_version)
+          TF014=$(terraform-0.14 version --json | jq -r .terraform_version)
+          TF015=$(terraform-0.15 version --json | jq -r .terraform_version)
+          TF1=$(terraform-1 version --json | jq -r .terraform_version)
+          # vert exits non-zero if any of the versions are not acceptable, so `|| [[ -n "$VERSION" ]]` for a real error check
+          FULL_VERSION=$(vert -s "$(terraform-config-inspect --json . | jq -r '.required_core[]')" "$TF012" "$TF013" "$TF014" "$TF015" "$TF1" | head -1) || [[ -n "$VERSION" ]]
+          VERSION=${FULL_VERSION:0:4}
+          echo Full version to use is ${FULL_VERSION}, setting VERSION to ${VERSION}
+        fi
+        # Match lables like `terraform/0.12` or nothing (to prevent non-zero exit code)
+        # Use [0-9] because \d is not standard part of egrep
+        OVERRIDE_VERSION=$(grep -Eo '(terraform/[0-9]+\.[x0-9]+|)' <<<${LABELS} | cut -d/ -f2)
+        if [ -n "${OVERRIDE_VERSION}" ]; then
+          VERSION=${OVERRIDE_VERSION}
+          echo "Terraform ${VERSION} is required based on labels..."
+        else
+          echo "Terraform ${VERSION} is required for ${BASE_REF}..."
+        fi
+        [[ $VERSION =~ ^1\. ]] && VERSION=1
+        PATH_TO_TERRAFORM="/usr/local/terraform/${VERSION}/bin"
+        if [ -x "${PATH_TO_TERRAFORM}/terraform" ]; then
+          echo "${PATH_TO_TERRAFORM}" >> "$GITHUB_PATH"
+        else
+          echo "Unable to locate executable for terraform ${VERSION}" >&2
+          exit 1
+        fi
+      env:
+        # Pull request target branch
+        BASE_REF: ${{ github.event.client_payload.pull_request.base.ref }}
+        LABELS: ${{ join(github.event.client_payload.pull_request.labels.*.name, '\n') }}
+
+    # Initialize the terratest go project
+    - name: "Initialize terratest Go project"
+      run: |
+        make -C test/src clean init
+        rm -rf examples/*/.terraform examples/*/.terraform.lock.hcl
+    - name: "Inject secrets"
+      env:
+        USES_GITHUB:   >-
+          ${{ contains(github.event.client_payload.github.payload.repository.name, '-github-')
+          || contains(github.event.client_payload.pull_request.labels.*.name, 'terraform-github-provider') }}
+        USES_OPSGENIE: >-
+          ${{ contains(github.event.client_payload.github.payload.repository.name, 'terraform-opsgenie-')
+          || contains(github.event.client_payload.pull_request.labels.*.name, 'terraform-opsgenie-provider') }}
+        USES_AWS: >-
+          ${{ contains(github.event.client_payload.github.payload.repository.name, 'terraform-aws-')
+          || contains(github.event.client_payload.pull_request.labels.*.name, 'terraform-aws-provider') }}
+        USES_SPOTINST: >-
+          ${{ contains(github.event.client_payload.github.payload.repository.name, '-spotinst-')
+          || contains(github.event.client_payload.pull_request.labels.*.name, 'terraform-spotinst-provider') }}
+        USES_DATADOG: >-
+          ${{ contains(github.event.client_payload.github.payload.repository.name, '-datadog-')
+          ||  contains(github.event.client_payload.pull_request.labels.*.name, 'terraform-datadog-provider') }}
+        USES_TFE: >-
+          ${{ contains(github.event.client_payload.github.payload.repository.name, '-tfe-')
+          ||  contains(github.event.client_payload.pull_request.labels.*.name, 'terraform-tfe-provider') }}
+        USES_CLOUDFLARE: >-
+          ${{ contains(github.event.client_payload.github.payload.repository.name, '-cloudflare-')
+          ||  contains(github.event.client_payload.pull_request.labels.*.name, 'terraform-cloudflare-provider') }}
+        AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        GITHUB_TOKEN:          ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        OPSGENIE_API_KEY:      ${{ secrets.OPSGENIE_API_KEY }}
+        DD_API_KEY:            ${{ secrets.DD_API_KEY }}
+        DD_APP_KEY:            ${{ secrets.DD_APP_KEY }}
+        SPOTINST_TOKEN:        ${{ secrets.SPOTINST_TOKEN }}
+        SPOTINST_ACCOUNT:      ${{ secrets.SPOTINST_ACCOUNT }}
+        TFE_TOKEN:             ${{ secrets.TFE_TOKEN }}
+        CLOUDFLARE_EMAIL:      ${{ secrets.CLOUDFLARE_EMAIL }}
+        CLOUDFLARE_API_KEY:    ${{ secrets.CLOUDFLARE_API_KEY }}
+      shell: bash
+      run: |
+        if [[ "$USES_AWS" == "true" || "$USES_DATADOG" == "true" || "$USES_SPOTINST" == "true" ]]; then
+          printf "%s=%s\n"  AWS_ACCESS_KEY_ID      "$AWS_ACCESS_KEY_ID"      >> "$GITHUB_ENV"
+          printf "%s=%s\n"  AWS_SECRET_ACCESS_KEY  "$AWS_SECRET_ACCESS_KEY"  >> "$GITHUB_ENV"
+          echo exported AWS
+        fi
+        if [[ "$USES_DATADOG" == "true" ]]; then
+          printf "%s=%s\n"  DD_API_KEY "$DD_API_KEY" >> "$GITHUB_ENV"
+          printf "%s=%s\n"  DD_APP_KEY "$DD_APP_KEY" >> "$GITHUB_ENV"
+          echo exported Datadog
+        fi
+        if [[ "$USES_GITHUB" == "true" ]]; then
+          printf "%s=%s\n"  GITHUB_TOKEN     "$GITHUB_TOKEN"     >> "$GITHUB_ENV"
+          echo exported GitHub
+        fi
+        if [[ "$USES_OPSGENIE" == "true" ]]; then
+          printf "%s=%s\n"  OPSGENIE_API_KEY "$OPSGENIE_API_KEY" >> "$GITHUB_ENV"
+          echo exported Opsgenie
+        fi
+        if [[ "$USES_SPOTINST" == "true" ]]; then
+          printf "%s=%s\n"  SPOTINST_TOKEN   "$SPOTINST_TOKEN"   >> "$GITHUB_ENV"
+          printf "%s=%s\n"  SPOTINST_ACCOUNT "$SPOTINST_ACCOUNT" >> "$GITHUB_ENV"
+          echo exported Spotinst
+        fi
+        if [[ "$USES_TFE" == "true" ]]; then
+          printf "%s=%s\n"  TFE_TOKEN   "$TFE_TOKEN"   >> "$GITHUB_ENV"
+          echo exported Terraform Cloud
+        fi
+        if [[ "$USES_CLOUDFLARE" == "true" ]]; then
+          printf "%s=%s\n"  CLOUDFLARE_EMAIL   "$CLOUDFLARE_EMAIL"   >> "$GITHUB_ENV"
+          printf "%s=%s\n"  CLOUDFLARE_API_KEY "$CLOUDFLARE_API_KEY" >> "$GITHUB_ENV"
+          echo exported CloudFlare
+        fi
+    - name: "Test `examples/complete` with terratest"
+      run: make -C test/src
+
+    # Update GitHub status for dispatch events
+    - name: "Update GitHub Status for failure"
+      if: ${{ failure() }}
+      uses: docker://cloudposse/github-status-updater
+      with:
+        args: "-action update_state -ref ${{ github.event.client_payload.pull_request.head.sha }} -repo ${{ github.event.client_payload.github.payload.repository.name }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        GITHUB_STATE: failure
+        GITHUB_CONTEXT: "test/terratest"
+        GITHUB_DESCRIPTION: "tests failed"
+        GITHUB_TARGET_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        GITHUB_REF: ${{ github.event.client_payload.pull_request.head.ref }}
+        GITHUB_OWNER: ${{ github.event.client_payload.github.payload.repository.owner.login }}
+
+    # Update GitHub status for dispatch events
+    - name: "Update GitHub Status for this success"
+      uses: docker://cloudposse/github-status-updater
+      with:
+        args: "-action update_state -ref ${{ github.event.client_payload.pull_request.head.sha }} -repo ${{ github.event.client_payload.github.payload.repository.name }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        GITHUB_STATE: success
+        GITHUB_CONTEXT: "test/terratest"
+        GITHUB_DESCRIPTION: "tests passed"
+        GITHUB_TARGET_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        GITHUB_REF: ${{ github.event.client_payload.pull_request.head.ref }}
+        GITHUB_OWNER: ${{ github.event.client_payload.github.payload.repository.owner.login }}
+
+    # Update GitHub status for dispatch events
+    - name: "Update GitHub Status for cancelled"
+      if: ${{ cancelled() }}
+      uses: docker://cloudposse/github-status-updater
+      with:
+        args: "-action update_state -ref ${{ github.event.client_payload.pull_request.head.sha }} -repo ${{ github.event.client_payload.github.payload.repository.name }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+        GITHUB_STATE: error
+        GITHUB_CONTEXT: "test/terratest"
+        GITHUB_DESCRIPTION: "tests cancelled"
+        GITHUB_TARGET_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        GITHUB_REF: ${{ github.event.client_payload.pull_request.head.ref }}
+        GITHUB_OWNER: ${{ github.event.client_payload.github.payload.repository.owner.login }}

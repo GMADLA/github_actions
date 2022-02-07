@@ -1,0 +1,48 @@
+
+
+name: Format terraform files
+on:
+  repository_dispatch:
+    types: [terraform-fmt-command]
+
+jobs:
+  terraform-fmt:
+    runs-on: ubuntu-latest
+    container: GMADLA/build-harness:slim-latest
+    steps:
+      # Checkout the pull request branch
+      - uses: actions/checkout@v2
+        with:
+          token: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+          repository: ${{ github.event.client_payload.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.client_payload.pull_request.head.ref }}
+
+      # Format Terraform files
+      - name: Format Terraform files
+        shell: bash
+        run: /usr/bin/make BUILD_HARNESS_PATH=/build-harness PACKAGES_PREFER_HOST=true -f /build-harness/templates/Makefile.build-harness terraform/fmt
+
+      # Commit changes (if any) to the PR branch
+      - name: Commit changes to the PR branch
+        shell: bash
+        run: |
+          set -x
+          output=$(git diff --name-only)
+          if [ -n "$output" ]; then
+            echo "Changes detected. Pushing to the PR branch"
+            git config --global user.name 'actions-bot'
+            git config --global user.email '58130806+actions-bot@users.noreply.github.com'
+            git add -A
+            git commit -m "Executed 'terraform fmt'"
+            git push
+          else
+            echo "No changes detected"
+          fi
+      # Add reaction to the original comment
+      - name: Add reaction to the original comment
+        uses: GMADLA/github_actions/github/create-or-update-comment@0.28.0
+        with:
+          token: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
+          repository: ${{ github.event.client_payload.github.payload.repository.full_name }}
+          comment-id: ${{ github.event.client_payload.github.payload.comment.id }}
+          reactions: hooray
